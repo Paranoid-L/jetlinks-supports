@@ -234,8 +234,22 @@ public class JetLinksDeviceMetadata implements DeviceMetadata {
     public DeviceMetadata merge(DeviceMetadata metadata, MergeOption... options) {
         JetLinksDeviceMetadata deviceMetadata = new JetLinksDeviceMetadata(this);
 
+        if (MergeOption.has(MergeOption.overwriteProperty, options)) {
+            deviceMetadata.properties.clear();
+        }
+
         for (PropertyMetadata property : metadata.getProperties()) {
             doMerge(deviceMetadata.properties, property, PropertyMetadata::merge, options);
+        }
+        //属性过滤
+        if (MergeOption.PropertyFilter.has(options)) {
+            Map<String, PropertyMetadata> temp = new LinkedHashMap<>(deviceMetadata.properties);
+            deviceMetadata.properties.clear();
+            for (Map.Entry<String, PropertyMetadata> entry : temp.entrySet()) {
+                if (MergeOption.PropertyFilter.doFilter(entry.getValue(), options)) {
+                    deviceMetadata.properties.put(entry.getKey(), entry.getValue());
+                }
+            }
         }
 
         for (FunctionMetadata func : metadata.getFunctions()) {
