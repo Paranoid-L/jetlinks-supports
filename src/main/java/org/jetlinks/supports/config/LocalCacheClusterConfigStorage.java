@@ -1,43 +1,106 @@
 package org.jetlinks.supports.config;
 
 import com.google.common.collect.Maps;
-import lombok.AllArgsConstructor;
 import org.jetlinks.core.Value;
 import org.jetlinks.core.Values;
 import org.jetlinks.core.cluster.ClusterCache;
+import org.jetlinks.core.config.ConfigKey;
 import org.jetlinks.core.config.ConfigStorage;
+import org.jetlinks.core.device.DeviceConfigKey;
 import org.jetlinks.core.event.EventBus;
+import org.jetlinks.core.utils.Reactors;
 import org.springframework.util.CollectionUtils;
+import org.springframework.util.ConcurrentReferenceHashMap;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Function;
 
-@AllArgsConstructor
+import static org.jetlinks.supports.config.EventBusStorageManager.NOTIFY_TOPIC;
+
 public class LocalCacheClusterConfigStorage implements ConfigStorage {
-    private final Map<String, Cache> caches = new ConcurrentHashMap<>();
+    @SuppressWarnings("all")
+    private static final AtomicReferenceFieldUpdater<Cache, Mono> CACHE_REF = AtomicReferenceFieldUpdater
+            .newUpdater(Cache.class, Mono.class, "ref");
+
+    private static final AtomicIntegerFieldUpdater<Cache> CACHE_VERSION = AtomicIntegerFieldUpdater
+            .newUpdater(Cache.class, "version");
+
+    private static final AtomicReferenceFieldUpdater<Cache, Disposable> CACHE_LOADER = AtomicReferenceFieldUpdater
+            .newUpdater(Cache.class, Disposable.class, "loader");
+
+    private static final Map<Value, Value> shared = new ConcurrentReferenceHashMap<>(1024);
+
+    private static final Set<String> sharedKey = ConcurrentHashMap.newKeySet();
+
+    private final Map<String, Cache> caches;
     private final String id;
     private final EventBus eventBus;
 
     private final ClusterCache<String, Object> clusterCache;
 
-    private long expires;
+    private final long expires;
+    private final Runnable doOnClear;
 
     public static final Value NULL = Value.simple(null);
 
-    class Cache {
-        long t = System.currentTimeMillis();
-        Mono<Value> dataGetter;
-        volatile Mono<Value> ref;
+    public LocalCacheClusterConfigStorage(String id,
+                                          EventBus eventBus,
+                                          ClusterCache<String, Object> clusterCache,
+                                          long expires,
+                                          Runnable doOnClear,
+                                          Map<String, Cache> cacheContainer) {
+        this.id = id;
+        this.eventBus = eventBus;
+        this.clusterCache = clusterCache;
+        this.expires = expires;
+        this.doOnClear = doOnClear;
+        this.caches = cacheContainer;
+    }
+
+    public LocalCacheClusterConfigStorage(String id, EventBus eventBus,
+                                          ClusterCache<String, Object> clusterCache,
+                                          long expires,
+                                          Runnable doOnClear) {
+        this(id, eventBus, clusterCache, expires, doOnClear, new ConcurrentHashMap<>());
+    }
+
+    private static Value tryShare(String key, Value val) {
+        if (!sharedKey.contains(key)) {
+            return val;
+        }
+        return shared.computeIfAbsent(val, Function.identity());
+    }
+
+    public class Cache {
+        final String key;
+        long t;
+        volatile int version;
         volatile Value cached;
+
+        volatile Mono<Value> ref;
+        Sinks.One<Value> sink;
+        volatile Disposable loader;
+
+        public Cache(String key) {
+            this.key = key;
+            updateTime();
+        }
 
         boolean isExpired() {
             return expires > 0 && System.currentTimeMillis() - t > expires;
         }
 
         Mono<Value> getRef() {
-            if (isExpired()) {
-                return dataGetter;
+            @SuppressWarnings("unchecked")
+            Mono<Value> ref = CACHE_REF.get(this);
+            if (isExpired() || ref == null) {
+                return reload();
             }
             return ref;
         }
@@ -49,33 +112,108 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
             return cached;
         }
 
+        public Object getCachedValue() {
+            Value cached = getCached();
+            return cached == null ? null : cached.get();
+        }
+
+        void updateTime() {
+            if (expires > 0) {
+                t = System.currentTimeMillis();
+            }
+        }
+
         void setValue(Object value) {
             setValue(value == null ? null : Value.simple(value));
         }
 
         void setValue(Value value) {
-            this.t = System.currentTimeMillis();
-            this.ref = Mono.justOrEmpty(value);
-            this.cached = value == null ? NULL : value;
+            updateTime();
+
+            CACHE_VERSION.incrementAndGet(this);
+            if (value != null) {
+                value = tryShare(key, value);
+                this.ref = Mono.just(value);
+                this.cached = value;
+            } else {
+                this.ref = Mono.empty();
+                this.cached = NULL;
+            }
+
+            dispose();
         }
 
-        void reload() {
+        synchronized Mono<Value> reload() {
             cached = null;
-            ref = this.dataGetter.cache();
+            dispose();
+
+            int version = this.version;
+            sink = Sinks.one();
+            Mono<Value> ref = sink.asMono();
+            CACHE_REF.set(this, ref);
+
+            Disposable[] disposables = new Disposable[1];
+
+            CACHE_LOADER.set(
+                    this,
+                    disposables[0] = clusterCache
+                            .get(key)
+                            .switchIfEmpty(Mono.fromRunnable(() -> {
+                                if (version == this.version) {
+                                    this.setValue(null);
+                                } else {
+                                    this.clear();
+                                }
+                                CACHE_LOADER.compareAndSet(this, disposables[0], null);
+                            }))
+                            .subscribe(
+                                    value -> {
+                                        if (this.version == version) {
+                                            this.setValue(value);
+                                        } else {
+                                            this.clear();
+                                        }
+                                        CACHE_LOADER.compareAndSet(this, disposables[0], null);
+                                    },
+                                    err -> {
+                                        this.clear();
+                                        sink.tryEmitError(err);
+                                        CACHE_LOADER.compareAndSet(this, disposables[0], null);
+                                    })
+            );
+            return ref;
         }
 
-        void init(Mono<Value> dataGetter) {
-            this.dataGetter = dataGetter
-                    .doOnNext(this::setValue)
-                    .switchIfEmpty(Mono.fromRunnable(() -> this.setValue(null)));
-            reload();
+        void clear() {
+            dispose();
+            cached = null;
+            CACHE_VERSION.incrementAndGet(this);
+            CACHE_REF.set(this, null);
         }
+
+        void dispose() {
+            Disposable disposable = CACHE_LOADER.getAndSet(this, null);
+            if (null != disposable) {
+                disposable.dispose();
+            }
+
+            Sinks.One<Value> sink = this.sink;
+            this.sink = null;
+
+            if (sink != null) {
+                Value value = this.cached != null ? this.cached : null;
+                if (value == null || value.get() == null) {
+                    sink.emitEmpty(Reactors.emitFailureHandler());
+                } else {
+                    sink.emitValue(value,Reactors.emitFailureHandler());
+                }
+            }
+        }
+
     }
 
     private Cache createCache(String key) {
-        Cache cache = new Cache();
-        cache.init(clusterCache.get(key).map(Value::simple));
-        return cache;
+        return new Cache(key);
     }
 
     private Cache getOrCreateCache(String key) {
@@ -90,31 +228,49 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
 
     @Override
     public Mono<Values> getConfigs(Collection<String> keys) {
-        Map<String, Object> caches = Maps.newHashMapWithExpectedSize(keys.size());
         int hits = 0;
+        Map<String, Object> loaded = Maps.newHashMapWithExpectedSize(keys.size());
+        //获取一级缓存
         for (String key : keys) {
             Cache local = getOrCreateCache(key);
             Value cached = local.getCached();
             if (cached != null) {
+                //命中一级缓存
                 hits++;
-                Object obj = cached.get();
-                if (null != obj) {
-                    caches.put(key, obj);
-                }
+                loaded.put(key, cached.get());
             }
         }
+        Values wrap = Values.of(Maps.filterValues(loaded, Objects::nonNull));
+        //全部来自一级缓存则直接返回
         if (hits == keys.size()) {
-            return Mono.just(Values.of(caches));
+            return Mono.just(wrap);
         }
+
+        //需要从二级缓存中加载的配置
         Set<String> needLoadKeys = new HashSet<>(keys);
-        needLoadKeys.removeAll(caches.keySet());
+        needLoadKeys.removeAll(loaded.keySet());
+        if (needLoadKeys.isEmpty()) {
+            return Mono.just(wrap);
+        }
+
+        //当前版本信息
+        Map<String, Integer> versions = Maps.newHashMapWithExpectedSize(needLoadKeys.size());
+        for (String needLoadKey : needLoadKeys) {
+            Cache cache = caches.get(needLoadKey);
+            if (cache != null) {
+                versions.put(needLoadKey, cache.version);
+            }
+        }
 
         return clusterCache
                 .get(needLoadKeys)
-                .reduce(caches, (map, entry) -> {
+                .reduce(loaded, (map, entry) -> {
                     String key = entry.getKey();
                     Object value = entry.getValue();
-                    getOrCreateCache(key).setValue(value);
+                    //加载到一级缓存中
+                    Cache cache = getOrCreateCache(key);
+                    int version = versions.getOrDefault(key, cache.version);
+                    updateValue(cache, version, value);
                     if (null != value) {
                         map.put(key, value);
                     }
@@ -123,32 +279,41 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
                 .defaultIfEmpty(Collections.emptyMap())
                 .doOnNext(map -> {
                     needLoadKeys.removeAll(map.keySet());
-                    if (needLoadKeys.size() > 0) {
+                    //还有配置没加载出来,说明这些配置不存在，则全部设置为null
+                    if (!needLoadKeys.isEmpty()) {
                         for (String needLoadKey : needLoadKeys) {
-                            getOrCreateCache(needLoadKey).setValue(null);
+                            Cache cache = this.getOrCreateCache(needLoadKey);
+                            int version = versions.getOrDefault(needLoadKey, cache.version);
+                            updateValue(cache, version, null);
                         }
                     }
                 })
-                .map(Values::of);
+                .thenReturn(wrap);
+    }
+
+    private void updateValue(Cache cache, int version, Object value) {
+        if (cache != null && cache.version == version) {
+            cache.setValue(value);
+        }
     }
 
     @Override
     public Mono<Boolean> setConfigs(Map<String, Object> values) {
         if (CollectionUtils.isEmpty(values)) {
-            return Mono.just(true);
+            return Reactors.ALWAYS_TRUE;
         }
         values.forEach((key, value) -> getOrCreateCache(key).setValue(value));
 
         return clusterCache
                 .putAll(values)
-                .then(notifyRemoveKey("__all"))
-                .thenReturn(true);
+                .then(notify(CacheNotify.expires(id, values.keySet())))
+                .then(Reactors.ALWAYS_TRUE);
     }
 
     @Override
     public Mono<Boolean> setConfig(String key, Object value) {
         if (key == null) {
-            return Mono.just(false);
+            return Reactors.ALWAYS_FALSE;
         }
         if (value == null) {
             return remove(key);
@@ -158,61 +323,92 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
         return clusterCache
                 .put(key, value)
                 .then(notifyRemoveKey(key))
-                .thenReturn(true)
-                .doOnSuccess(s -> {
-                    Cache cache = caches.get(key);
-                    if (cache != null) {
-                        cache.reload();
-                    }
-                });
+                .then(Reactors.ALWAYS_TRUE);
     }
 
     @Override
     public Mono<Boolean> remove(String key) {
-        caches.remove(key);
         return clusterCache
                 .remove(key)
                 .then(notifyRemoveKey(key))
-                .thenReturn(true);
+                .then(Reactors.ALWAYS_TRUE);
     }
 
     @Override
     public Mono<Value> getAndRemove(String key) {
         return clusterCache
                 .getAndRemove(key)
-                .flatMap(res -> notifyRemoveKey("__all").thenReturn(res))
+                .flatMap(res -> notify(CacheNotify.expires(id, Collections.singleton(key))).thenReturn(res))
                 .map(Value::simple);
     }
 
     @Override
     public Mono<Boolean> remove(Collection<String> key) {
-        key.forEach(caches::remove);
         return clusterCache
                 .remove(key)
-                .then(notifyRemoveKey("__all"))
-                .thenReturn(true);
+                .then(notify(CacheNotify.expires(id, key)))
+                .then(Reactors.ALWAYS_TRUE);
     }
 
     @Override
     public Mono<Boolean> clear() {
-        caches.clear();
         return clusterCache
                 .clear()
-                .then(notifyRemoveKey("__all"))
-                .thenReturn(true);
+                .then(notify(CacheNotify.clear(id)))
+                .then(Reactors.ALWAYS_TRUE);
     }
 
-    void clearLocalCache(String key) {
-        if ("__all".equals(key)) {
+    void clearLocalCache(CacheNotify notify) {
+        if (CollectionUtils.isEmpty(notify.getKeys())) {
             caches.clear();
-        } else if (key != null) {
-            caches.remove(key);
+        } else {
+            notify.getKeys().forEach(caches::remove);
+        }
+        if (notify.isClear()) {
+            if (doOnClear != null) {
+                doOnClear.run();
+            }
         }
     }
 
-    Mono<Void> notifyRemoveKey(String key) {
+    Mono<Void> notify(CacheNotify notify) {
+        clearLocalCache(notify);
         return eventBus
-                .publish("/_sys/cluster_cache/" + id, key)
+                .publish(NOTIFY_TOPIC, notify)
                 .then();
+    }
+
+    Mono<Void> notifyRemoveKey(String key) {
+        return notify(CacheNotify.expires(id, Collections.singleton(key)));
+    }
+
+    @Override
+    public Mono<Void> refresh() {
+        return notify(CacheNotify.expiresAll(id));
+    }
+
+    @Override
+    public Mono<Void> refresh(Collection<String> keys) {
+        return notify(CacheNotify.expires(id, keys));
+    }
+
+    static {
+
+        addSharedKey(DeviceConfigKey.productId);
+        addSharedKey(DeviceConfigKey.protocol);
+        addSharedKey(DeviceConfigKey.connectionServerId);
+        addSharedKey("state");
+        addSharedKey("productName");
+
+    }
+
+    public static void addSharedKey(ConfigKey<?>... key) {
+        for (ConfigKey<?> configKey : key) {
+            sharedKey.add(configKey.getKey());
+        }
+    }
+
+    public static void addSharedKey(String... key) {
+        sharedKey.addAll(Arrays.asList(key));
     }
 }

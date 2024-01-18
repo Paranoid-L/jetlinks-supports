@@ -1,52 +1,74 @@
 package org.jetlinks.supports.cache;
 
 import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
 import org.h2.mvstore.Cursor;
 import org.h2.mvstore.MVMap;
 import org.h2.mvstore.MVStore;
-import org.jetlinks.core.Payload;
+import org.h2.mvstore.type.DataType;
 import org.jetlinks.core.cache.FileQueue;
 import org.jetlinks.core.codec.Codec;
 import org.jetlinks.core.config.ConfigKey;
+import org.jetlinks.core.utils.ConverterUtils;
+import org.jetlinks.supports.utils.MVStoreUtils;
 import org.springframework.util.Assert;
 
 import javax.annotation.Nonnull;
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.NoSuchElementException;
-import java.util.concurrent.atomic.AtomicLong;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * http://www.h2database.com/html/mvstore.html
+ * 基于 <a href="http://www.h2database.com/html/mvstore.html">h2database mvstore</a>实现的本地队列,可使用此队列进行数据本地持久化
  *
  * @param <T> Type
  */
+@Slf4j
 class MVStoreQueue<T> implements FileQueue<T> {
 
+    @SuppressWarnings("all")
+    private final static AtomicLongFieldUpdater<MVStoreQueue> INDEX =
+        AtomicLongFieldUpdater.newUpdater(MVStoreQueue.class, "index");
+
     private MVStore store;
-    private MVMap<Long, byte[]> mvMap;
+    private MVMap<Long, T> mvMap;
 
-    private final AtomicLong index = new AtomicLong();
-
-    private final Codec<T> codec;
+    private volatile long index = 0;
 
     private final String name;
 
     private final Path storageFile;
 
+    private final Map<String, Object> options;
+
+    private final ReentrantLock pollLock = new ReentrantLock();
+    private final ReentrantLock writeLock = new ReentrantLock();
+
     @SneakyThrows
     MVStoreQueue(Path filePath,
                  String name,
-                 Codec<T> codec) {
+                 Map<String, Object> options) {
         Files.createDirectories(filePath);
         this.name = name;
         this.storageFile = filePath.resolve(name);
-        this.codec = codec;
+        this.options = options;
         open();
     }
+
+    MVStoreQueue(MVMap<Long, T> mvMap) {
+        this.storageFile = null;
+        this.name = mvMap.getName();
+        this.options = null;
+        this.mvMap = mvMap;
+        if (!mvMap.isEmpty()) {
+            INDEX.set(this, mvMap.lastKey());
+        }
+    }
+
 
     protected void open() {
         try {
@@ -56,19 +78,25 @@ class MVStoreQueue<T> implements FileQueue<T> {
         } catch (Throwable ignore) {
 
         }
-        String path = storageFile.toUri().getScheme().equals("jimfs") ?
-                storageFile.toUri().toString() : storageFile.toString();
 
-        store = new MVStore.Builder()
-                .fileName(path)
-                // TODO: 2021/7/13 配置化
-                .cacheSize(1)
-                .autoCommitDisabled()
-                .open();
+        store = MVStoreUtils.open(
+            storageFile.toFile(),
+            name,
+            builder -> builder
+                .cacheSize(16)
+                .autoCommitBufferSize(32 * 1024)
+                .compress());
+        Object type = options.get("valueType");
 
-        mvMap = store.openMap(name);
-        if (!mvMap.isEmpty())
-            index.set(mvMap.lastKey());
+        MVMap.Builder<Long, T> mapBuilder = new MVMap.Builder<>();
+        if (type instanceof DataType) {
+            mapBuilder.valueType(((DataType<T>) type));
+        }
+
+        mvMap = store.openMap("queue", mapBuilder);
+        if (!mvMap.isEmpty()) {
+            INDEX.set(this, mvMap.lastKey());
+        }
 
     }
 
@@ -78,44 +106,51 @@ class MVStoreQueue<T> implements FileQueue<T> {
         if (store.isClosed()) {
             return;
         }
-        store.commit();
-        store.sync();
+        // store.commit();
+        store.compactFile((int) Duration.ofSeconds(30).toMillis());
+    }
+
+    @Override
+    public T removeFirst() {
+        checkClose();
+        pollLock.lock();
+        try {
+            Long key = mvMap.firstKey();
+            return key == null ? null : mvMap.remove(key);
+        } finally {
+            pollLock.unlock();
+        }
+    }
+
+    @Override
+    public T removeLast() {
+        checkClose();
+        pollLock.lock();
+        try {
+            Long key = mvMap.lastKey();
+            return key == null ? null : mvMap.remove(key);
+        } finally {
+            pollLock.unlock();
+        }
     }
 
     @Override
     public synchronized void close() {
+        if (store == null) {
+            return;
+        }
         if (store.isClosed()) {
             return;
         }
+        store.compactFile((int) Duration.ofSeconds(30).toMillis());
         store.sync();
         store.close();
     }
 
     private void checkClose() {
-        if (store.isClosed()) {
+        if (store != null && store.isClosed()) {
             throw new IllegalStateException("file queue " + name + " is closed");
         }
-    }
-
-    private byte[] encode(T data) {
-        return codec.encode(data)
-                    .getBytes(true);
-    }
-
-    private T decode(byte[] data) {
-        if (data == null) {
-            return null;
-        }
-        Payload payload = Payload.of(data);
-        T val = null;
-        try {
-            val = codec.decode(payload);
-        } finally {
-            if (!(val instanceof Payload)) {
-                payload.release();
-            }
-        }
-        return val;
     }
 
     @Override
@@ -140,7 +175,7 @@ class MVStoreQueue<T> implements FileQueue<T> {
     @Nonnull
     public Iterator<T> iterator() {
         checkClose();
-        Cursor<Long, byte[]> cursor = mvMap.cursor(mvMap.firstKey());
+        Cursor<Long, T> cursor = mvMap.cursor(null, null, false);
 
         return new Iterator<T>() {
             @Override
@@ -150,7 +185,14 @@ class MVStoreQueue<T> implements FileQueue<T> {
 
             @Override
             public T next() {
-                return decode(cursor.getValue());
+                T next = cursor.getValue();
+                cursor.next();
+                return next;
+            }
+
+            @Override
+            public void remove() {
+                mvMap.remove(cursor.getKey());
             }
         };
     }
@@ -174,11 +216,21 @@ class MVStoreQueue<T> implements FileQueue<T> {
         if (null == t) {
             return false;
         }
-        byte[] val = encode(t);
-        do {
-            val = mvMap.put(index.incrementAndGet(), val);
-        } while (val != null);
+        //lock, 多线程下,mvMap的锁可能导致性能问题
+        writeLock.lock();
+        try {
+            doAdd(t);
+        } finally {
+            writeLock.unlock();
+        }
         return true;
+    }
+
+    private void doAdd(T value) {
+        T old;
+        do {
+            old = mvMap.putIfAbsent(INDEX.incrementAndGet(this), value);
+        } while (old != null);
     }
 
     @Override
@@ -195,8 +247,13 @@ class MVStoreQueue<T> implements FileQueue<T> {
     @Override
     public boolean addAll(Collection<? extends T> c) {
         checkClose();
-        for (T t : c) {
-            add(t);
+        writeLock.lock();
+        try {
+            for (T t : c) {
+                doAdd(t);
+            }
+        } finally {
+            writeLock.unlock();
         }
         return true;
     }
@@ -213,11 +270,11 @@ class MVStoreQueue<T> implements FileQueue<T> {
 
     @Override
     public void clear() {
-        if(mvMap.isClosed()){
+        if (mvMap.isClosed()) {
             return;
         }
         mvMap.clear();
-        index.set(0);
+        INDEX.set(this, 0);
     }
 
     @Override
@@ -238,25 +295,24 @@ class MVStoreQueue<T> implements FileQueue<T> {
 
     @Override
     public T poll() {
-        if(mvMap.isClosed()){
+        if (mvMap.isClosed()) {
             return null;
         }
-        byte[] removed;
-        synchronized (this) {
+        T removed;
+        try {
+            pollLock.lock();
             Long key = mvMap.firstKey();
             removed = key == null ? null : mvMap.remove(key);
-            if (removed == null) {
-                index.set(0);
-                return null;
-            }
+        } finally {
+            pollLock.unlock();
         }
-        return decode(removed);
+        return removed;
 
     }
 
     @Override
     public T element() {
-        if(mvMap.isClosed()){
+        if (mvMap.isClosed()) {
             return null;
         }
         T data = peek();
@@ -269,8 +325,7 @@ class MVStoreQueue<T> implements FileQueue<T> {
     @Override
     public T peek() {
         checkClose();
-        byte[] value = mvMap.get(mvMap.firstKey());
-        return decode(value);
+        return mvMap.get(mvMap.firstKey());
     }
 
 
@@ -278,6 +333,8 @@ class MVStoreQueue<T> implements FileQueue<T> {
         private String name;
         private Codec<T> codec;
         private Path path;
+
+        private Map<String, Object> options = new HashMap<>();
 
         @Override
         public FileQueue.Builder<T> name(String name) {
@@ -299,16 +356,19 @@ class MVStoreQueue<T> implements FileQueue<T> {
 
         @Override
         public FileQueue.Builder<T> options(Map<String, Object> options) {
+            this.options.putAll(options);
             return this;
         }
 
         @Override
         public FileQueue.Builder<T> option(String key, Object value) {
+            this.options.put(key, value);
             return this;
         }
 
         @Override
         public <V> FileQueue.Builder<T> option(ConfigKey<V> key, V value) {
+            this.options.put(key.getName(), value);
             return this;
         }
 
@@ -317,7 +377,13 @@ class MVStoreQueue<T> implements FileQueue<T> {
             Assert.hasText(name, "name must not be empty");
             Assert.notNull(path, "path must not be null");
             Assert.notNull(path, "codec must not be null");
-            return new MVStoreQueue<>(path, name, codec);
+            int concurrency = ConverterUtils
+                .convert(options.getOrDefault("concurrency", 1), Integer.class);
+            if (concurrency > 1) {
+                return new ConcurrencyMVStoreQueue<>(path, name, options, ConverterUtils.convert(options.get("concurrency"), Integer.class));
+            }
+            return new MVStoreQueue<>(path, name, options);
+
         }
     }
 }

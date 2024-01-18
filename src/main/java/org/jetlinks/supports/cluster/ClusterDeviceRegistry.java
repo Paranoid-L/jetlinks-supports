@@ -54,6 +54,7 @@ public class ClusterDeviceRegistry implements DeviceRegistry {
     @Setter
     private ThingRpcSupportChain rpcChain;
 
+    @Deprecated
     public ClusterDeviceRegistry(ProtocolSupports supports,
                                  ClusterManager clusterManager,
                                  DeviceOperationBroker handler) {
@@ -77,6 +78,7 @@ public class ClusterDeviceRegistry implements DeviceRegistry {
         this.addStateChecker(DefaultDeviceOperator.DEFAULT_STATE_CHECKER);
     }
 
+    @Deprecated
     public ClusterDeviceRegistry(ProtocolSupports supports,
                                  ClusterManager clusterManager,
                                  DeviceOperationBroker handler,
@@ -127,10 +129,13 @@ public class ClusterDeviceRegistry implements DeviceRegistry {
         }
         DeviceOperator deviceOperator = createOperator(deviceId);
         return deviceOperator
+                //有productId说明是存在的设备
                 .getSelfConfig(DeviceConfigKey.productId)
-                .doOnNext(r -> operatorCache.put(deviceId, Mono
-                        .just(deviceOperator)
-                        .filterWhen(device -> device.getSelfConfig(DeviceConfigKey.productId).hasElement())
+                .doOnNext(r -> operatorCache.put(deviceId, deviceOperator
+                        .getSelfConfig(DeviceConfigKey.productId)
+                        .map(ignore -> deviceOperator)
+                        //设备被注销了？则移除之
+                        .switchIfEmpty(Mono.fromRunnable(() -> operatorCache.invalidate(deviceId)))
                 ))
                 .map(ignore -> deviceOperator);
 
@@ -249,7 +254,9 @@ public class ClusterDeviceRegistry implements DeviceRegistry {
     public Mono<DeviceProductOperator> register(ProductInfo productInfo) {
         return Mono.defer(() -> {
             DefaultDeviceProductOperator operator = createProductOperator(productInfo.getId(), productInfo.getVersion());
-            productOperatorMap.put(operator.getId(), operator);
+            String cacheId = createProductCacheKey(productInfo.getId(), productInfo.getVersion());
+            productOperatorMap.put(cacheId, operator);
+
             Map<String, Object> configs = new HashMap<>();
 
             Optional.ofNullable(productInfo.getConfiguration())

@@ -7,15 +7,23 @@
     <logger name="io.lettuce" level="warn"/>
     <logger name="org.springframework" level="warn"/>
     <logger name="io.rsocket.FrameLogger" level="warn"/>
+    　<logger name="org.jetlinks.core.utils" level="warn"/>
+    　<logger name="org.jetlinks.core.codec.Codecs" level="warn"/>
+    　
+    <logger name="io.scalecube" level="warn"/>
     　
     <logger name="org.jetlinks" level="warn"/>
     <logger name="org.jetlinks.core.event.TopicPayload" level="debug"/>
     <logger name="org.jetlinks.supports.ipc" level="debug"/>
     <logger name="org.jetlinks.core" level="debug"/>
-<!--    <logger name="ipc" level="trace"/>-->
+    <!--    <logger name="ipc" level="trace"/>-->
 
     <!--    　<logger name="org.jetlinks.supports.cluster" level="trace"/>-->
-        　<logger name="org.jetlinks.supports.cluster.event.RedisRSocketEventBroker" level="trace"/>
+    　  <logger name="org.jetlinks.supports.device.session.AbstractDeviceSessionManager" level="trace"/>
+
+    <logger name="org.jetlinks.supports.scalecube.ExtendedClusterImpl" level="debug"/>
+
+    <logger name="org.jetlinks.supports.scalecube.rpc.ScalecubeRpcManager" level="debug"/>
 
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>

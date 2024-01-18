@@ -10,9 +10,12 @@ import org.springframework.data.redis.serializer.RedisSerializer;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 @SuppressWarnings("all")
 @Slf4j
@@ -75,22 +78,40 @@ public class RedisClusterManager implements ClusterManager {
         this.haManager.startup();
 
         //定时尝试拉取队列数据
-        disposable.add(Flux.interval(Duration.ofSeconds(5))
-                           .flatMap(i -> Flux.fromIterable(queues.values()))
-                           .subscribe(RedisClusterQueue::tryPoll)
+        disposable.add(
+                Flux.interval(Duration.ofSeconds(5))
+                    .flatMap(i -> Mono
+                            .defer(() -> {
+                                Set<String> readyToRemove = new HashSet<>();
+                                return Flux
+                                        .fromIterable(queues.entrySet())
+                                        .doOnNext(queue -> {
+
+                                            queue.getValue().tryPoll();
+                                            //移除太久未使用的队列,释放内存
+                                            if (!queue.getValue().hasLocalConsumer()
+                                                    && queue.getValue().tooLongNoVisit(7200_000)) {
+                                                readyToRemove.add(queue.getKey());
+                                            }
+                                        })
+                                        .then(Mono.fromRunnable(() -> {
+                                            readyToRemove.forEach(queues::remove);
+                                        }));
+                            }))
+                    .subscribe()
         );
 
         disposable.add(this.queueRedisTemplate
-                .<String>listenToPattern("queue:data:produced")
-                .doOnError(err -> {
-                    log.error(err.getMessage(), err);
-                })
-                .subscribe(sub -> {
-                    RedisClusterQueue queue = queues.get(sub.getMessage());
-                    if (queue != null) {
-                        queue.tryPoll();
-                    }
-                })
+                               .<String>listenToPattern("queue:data:produced")
+                               .doOnError(err -> {
+                                   log.error(err.getMessage(), err);
+                               })
+                               .subscribe(sub -> {
+                                   RedisClusterQueue queue = queues.get(sub.getMessage());
+                                   if (queue != null) {
+                                       queue.tryPoll();
+                                   }
+                               })
         );
     }
 
@@ -130,12 +151,17 @@ public class RedisClusterManager implements ClusterManager {
 
     @Override
     public <K, V> ClusterCache<K, V> getCache(String cache) {
-        return caches.computeIfAbsent(cache, id -> new RedisClusterCache<K, V>(id, this.getRedis()));
+        return caches.computeIfAbsent(cache, this::createCache);
+    }
+
+    @Override
+    public <K, V> ClusterCache<K, V> createCache(String cacheName) {
+        return new RedisClusterCache<K, V>(cacheName, this.getRedis());
     }
 
     @Override
     public <V> ClusterSet<V> getSet(String name) {
-        return sets.computeIfAbsent(name, id -> new RedisClusterSet<V>(id, this.getRedis()));
+        return new RedisClusterSet<V>(name, this.getRedis());
     }
 
     @Override
